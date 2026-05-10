@@ -11,6 +11,9 @@ __pycache__/
 *$py.class
 *.so
 
+# ---- Jupyter Notebook ----------------------------------------------------
+.ipynb_checkpoints
+
 # ---- Packaging / distribution --------------------------------------------
 build/
 dist/

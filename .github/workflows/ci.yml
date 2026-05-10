@@ -1,0 +1,78 @@
+name: CI
+
+# Run on every push to main and on every PR targeting main. Other
+# branches don't trigger CI by default — open a PR to get feedback.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref when a new push arrives.
+# Saves CI minutes and gets you the "latest commit only" result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default to read-only permissions; release.yml elevates as needed.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff (lint)
+        run: ruff check src tests
+
+      - name: black (format check)
+        run: black --check src tests
+
+      - name: mypy (strict type check)
+        run: mypy src
+
+  test:
+    name: Test (Python ${{ matrix.python-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't bail out on the first failing matrix cell — we want to
+      # see whether a failure is platform-specific or version-specific.
+      fail-fast: false
+      matrix:
+        # Cavern is POSIX-only (its __init__ raises ImportError on
+        # Windows), so we don't include windows-latest.
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -v --cov=cavern --cov-report=term

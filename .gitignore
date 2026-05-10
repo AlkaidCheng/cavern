@@ -1,0 +1,82 @@
+# Cavern source-tree .gitignore
+#
+# This file is for the cavern *source repository* on GitHub. It is
+# distinct from the .gitignore that `cavern init` writes inside a
+# *vault directory* (which contains `.lock` and `.tmp.*` to keep
+# local-only state out of the user's encrypted vault commits).
+
+# ---- Python bytecode and caches ------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ---- Packaging / distribution --------------------------------------------
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+.installed.cfg
+
+# ---- Virtual environments ------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.env
+.python-version
+
+# ---- Test artifacts ------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# ---- Static analysis caches ----------------------------------------------
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ---- Editors and IDEs ----------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# ---- OS junk -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Documentation builds ------------------------------------------------
+docs/_build/
+site/
+
+# ---- Local development scratch ------------------------------------------
+# Test vaults a developer might create via `CAVERN_VAULT_DIR=./vault`
+# while iterating on the code. The user's *real* vault lives at
+# ~/.cavern (or wherever they point it) and is never inside this repo.
+/vault/
+/test-vault/
+/scratch/
+
+# ---- Secrets that must never be committed --------------------------------
+# Defense in depth: every cavern file is encrypted, but a developer
+# might accidentally drop a plaintext export, dump file, or
+# bulk-insert JSON into the working tree while testing. None of these
+# patterns belong on PyPI or in a public source tree.
+*.cvd
+secrets.json
+secrets.yaml
+*.pem
+*.key
+.envrc

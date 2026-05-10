@@ -1,0 +1,133 @@
+name: Release
+
+# Triggered when a GitHub Release is published. We use `published`
+# rather than `created` so drafting a release in the GitHub UI doesn't
+# fire the publish step prematurely — the release has to actually go
+# live.
+#
+# Also exposes a manual `workflow_dispatch` button so maintainers can
+# build (but not publish) on demand for verification.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false  # never cancel an in-progress publish
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Sanity-gate: re-run the test suite on the release commit.
+  #
+  # CI on `main` already covers this for the normal flow, but a release
+  # can technically be tagged on any commit, so we re-verify before
+  # touching PyPI. We only run a single Python version here (latest
+  # stable) — the full matrix lives in ci.yml.
+  # ---------------------------------------------------------------------
+  test:
+    name: Sanity-test the release commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -v
+
+  # ---------------------------------------------------------------------
+  # 2. Build a single universal sdist + wheel.
+  #
+  # Cavern is pure Python — `python -m build` produces:
+  #   - dist/cavern-X.Y.Z.tar.gz       (sdist)
+  #   - dist/cavern-X.Y.Z-py3-none-any.whl  (universal wheel)
+  # No cibuildwheel needed.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: List built artifacts
+        run: ls -l dist/
+
+      - name: Upload distributions as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # ---------------------------------------------------------------------
+  # 3. Publish to PyPI via Trusted Publishing (OIDC).
+  #
+  # This job ONLY runs on a real `release: published` event — the
+  # manual workflow_dispatch path stops at `build` so maintainers can
+  # download and inspect the artifacts without touching PyPI.
+  #
+  # PyPI-side setup (one-time, before the first release):
+  #   1. Create the project on PyPI (or use an existing one).
+  #   2. Add a Trusted Publisher under "Publishing" → "Trusted
+  #      Publishers" with:
+  #        - Owner:           <your-github-username-or-org>
+  #        - Repository:      cavern
+  #        - Workflow name:   release.yml
+  #        - Environment:     pypi
+  #   3. Create a GitHub Environment named `pypi` on this repo
+  #      (Settings → Environments → New environment → "pypi"). You
+  #      can optionally require manual approval before each publish.
+  # ---------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'release'
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cavern
+
+    permissions:
+      id-token: write  # required for OIDC token used by Trusted Publishing
+
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: List artifacts before upload
+        run: ls -l dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No user/password — Trusted Publishing handles auth via OIDC.

@@ -69,7 +69,23 @@ def test_bucket_selection(plaintext_len: int, expected_bucket: int) -> None:
         b"a" * 1024,
         b"a" * 5000,
         b"a" * 16384,
-        os.urandom(20_000),
+        os.urandom(20_480),
+    ],
+    # Without explicit ids, pytest renders each `bytes` parameter as
+    # its repr — so a 20 480-byte random value produces a 100 KB test
+    # name. Naming each case keeps `pytest -v` output compact and
+    # actually informative.
+    ids=[
+        "empty",
+        "1B",
+        "7B",
+        "100B",
+        "256B",
+        "1023B",
+        "1024B",
+        "5000B",
+        "16KiB",
+        "20KiB-random",
     ],
 )
 def test_padding_roundtrip(plaintext: bytes) -> None:
@@ -197,6 +213,16 @@ def test_wrap_uses_fresh_nonces() -> None:
         b"a" * 500,
         b"a" * 5000,
         b"a" * 20_000,  # > 16 KiB bucket
+    ],
+    ids=[
+        "empty",
+        "ascii",
+        "multiline",
+        "binary-bytes",
+        "50B",
+        "500B",
+        "5000B",
+        "20000B",
     ],
 )
 def test_encrypt_decrypt_roundtrip(plaintext: bytes) -> None:

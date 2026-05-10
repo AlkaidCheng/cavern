@@ -69,10 +69,10 @@ def test_bucket_selection(plaintext_len: int, expected_bucket: int) -> None:
         b"a" * 1024,
         b"a" * 5000,
         b"a" * 16384,
-        os.urandom(20_000),
+        os.urandom(20_480),
     ],
     # Without explicit ids, pytest renders each `bytes` parameter as
-    # its repr — so a 20 000-byte random value produces a 100 KB test
+    # its repr — so a 20 480-byte random value produces a 100 KB test
     # name. Naming each case keeps `pytest -v` output compact and
     # actually informative.
     ids=[

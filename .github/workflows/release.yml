@@ -93,17 +93,6 @@ jobs:
   # manual workflow_dispatch path stops at `build` so maintainers can
   # download and inspect the artifacts without touching PyPI.
   #
-  # PyPI-side setup (one-time, before the first release):
-  #   1. Create the project on PyPI (or use an existing one).
-  #   2. Add a Trusted Publisher under "Publishing" → "Trusted
-  #      Publishers" with:
-  #        - Owner:           <your-github-username-or-org>
-  #        - Repository:      cavern
-  #        - Workflow name:   release.yml
-  #        - Environment:     pypi
-  #   3. Create a GitHub Environment named `pypi` on this repo
-  #      (Settings → Environments → New environment → "pypi"). You
-  #      can optionally require manual approval before each publish.
   # ---------------------------------------------------------------------
   publish:
     name: Publish to PyPI

@@ -8,7 +8,7 @@ packages = ["src/cavern"]
 [project]
 name = "cavern"
 version = "0.1.0"
-description = "A command-line credential vault with strong encryption, GPG-protected master key, and optional 2FA support."
+description = "A metadata-hiding credential vault built on GPG and authenticated encryption."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -29,20 +29,16 @@ classifiers = [
 ]
 dependencies = [
     "cryptography>=42",
+    "pyotp>=2.9",
 ]
 
 [project.optional-dependencies]
-totp = [
-    "pyotp>=2.9",
-]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
     "black>=24.0",
     "ruff>=0.4",
     "mypy>=1.8",
-    # Pull totp into the dev install so the full test suite runs.
-    "pyotp>=2.9",
 ]
 
 [project.scripts]
@@ -77,4 +73,4 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -q --strict-markers"
+addopts = "-ra --strict-markers"

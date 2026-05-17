@@ -864,3 +864,4 @@ def rewrap_master_key_in_blob(
         + new_wrapped_dek
         + blob[after_dek:]
     )
+    

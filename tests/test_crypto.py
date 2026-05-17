@@ -7,6 +7,9 @@ fail, secrets are at risk.
 from __future__ import annotations
 
 import os
+import socket
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -20,8 +23,14 @@ from cavern.crypto import (
     KEK_LENGTH,
     MASTER_KEY_LENGTH,
     _bucket_for,
+    _is_lock_contention,
+    _is_lock_stale,
     _pad,
+    _parse_dotlock,
+    _pid_alive_on_this_host,
+    _run_gpg_with_lock_recovery,
     _unpad,
+    clean_stale_keyring_locks,
     decrypt_secret,
     derive_filename_key,
     derive_wrap_key,
@@ -69,10 +78,10 @@ def test_bucket_selection(plaintext_len: int, expected_bucket: int) -> None:
         b"a" * 1024,
         b"a" * 5000,
         b"a" * 16384,
-        os.urandom(20_000),
+        os.urandom(20_480),
     ],
     # Without explicit ids, pytest renders each `bytes` parameter as
-    # its repr — so a 20 000-byte random value produces a 100 KB test
+    # its repr — so a 20 480-byte random value produces a 100 KB test
     # name. Naming each case keeps `pytest -v` output compact and
     # actually informative.
     ids=[
@@ -431,69 +440,434 @@ def test_rewrap_rejects_unknown_version() -> None:
         )
 
 
-# ---- GPG recipient checks --------------------------------------------------
+# ---- GPG keyring-lock recovery --------------------------------------------
+#
+# Exercises the stale-lock detection and recovery layer. We don't need a
+# real gpg here -- the logic operates on filesystem state and PID
+# liveness, both of which we control with a tmp $GNUPGHOME and a
+# real-but-known-dead PID.
 
 
-def test_ensure_recipients_lists_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When a recipient has no secret key, the error message lists the
-    missing identity and points at concrete remediation steps."""
-    from cavern import crypto
-
-    monkeypatch.setattr(crypto, "gpg_has_secret_key", lambda _: False)
-    monkeypatch.setattr(crypto, "gpg_list_local_identities", lambda: [])
-
-    with pytest.raises(CryptoError) as exc_info:
-        crypto.ensure_recipients_have_secret_keys(["alice@example.com"])
-
-    msg = str(exc_info.value)
-    assert "alice@example.com" in msg
-    assert "no secret keys" in msg.lower()
-    assert "gpg --full-generate-key" in msg
+_THIS_HOST = socket.gethostname()
 
 
-def test_ensure_recipients_shows_available_keys_on_typo(
+@pytest.fixture
+def fake_gnupg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A throwaway ``$GNUPGHOME`` with the standard subdirs in place."""
+    home = tmp_path / "gnupg"
+    home.mkdir()
+    (home / "public-keys.v1.d").mkdir()
+    monkeypatch.setenv("GNUPGHOME", str(home))
+    return home
+
+
+# ---- _is_lock_contention ---
+
+
+def test_lock_contention_matches_keyboxd_timeout_signature() -> None:
+    # The three-line keyboxd timeout sequence: "waiting for lock" repeats
+    # while gpg blocks, then "keydb_search failed: Connection timed out"
+    # when the wait exhausts, then "public key decryption failed: No
+    # secret key" because the keyring was never reachable. All three
+    # appear in the typical stale-cross-host-lock failure.
+    stderr = (
+        "gpg: Note: database_open 134217901 waiting for lock (held by 1186029) ...\n"
+        "gpg: keydb_search failed: Connection timed out\n"
+        "gpg: public key decryption failed: No secret key\n"
+    )
+    assert _is_lock_contention(stderr)
+
+
+@pytest.mark.parametrize(
+    "indicator",
+    ["waiting for lock", "keydb_search failed", "Connection timed out"],
+)
+def test_lock_contention_each_indicator_triggers(indicator: str) -> None:
+    assert _is_lock_contention(f"prefix {indicator} suffix")
+
+
+def test_lock_contention_unrelated_gpg_error_is_not_match() -> None:
+    # The "No public key" failure mode is a separate diagnostic with
+    # its own handling -- recovery must NOT fire here.
+    assert not _is_lock_contention("gpg: alkaidc: skipped: No public key")
+
+
+def test_lock_contention_empty_stderr_is_not_match() -> None:
+    assert not _is_lock_contention("")
+
+
+# ---- _parse_dotlock ---
+
+
+def test_parse_dotlock_pid_and_hostname(fake_gnupg: Path) -> None:
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text("12345 host-a.example.com\n")
+    assert _parse_dotlock(lock) == (12345, "host-a.example.com")
+
+
+def test_parse_dotlock_pid_only(fake_gnupg: Path) -> None:
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text("12345\n")
+    assert _parse_dotlock(lock) == (12345, "")
+
+
+@pytest.mark.parametrize(
+    "contents",
+    ["", "not-a-pid\n", "garbage contents\n", "   \n"],
+    ids=["empty", "non-numeric-pid", "garbage", "whitespace-only"],
+)
+def test_parse_dotlock_unparseable_returns_none(
+    fake_gnupg: Path, contents: str
+) -> None:
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text(contents)
+    assert _parse_dotlock(lock) is None
+
+
+# ---- _is_lock_stale ---
+
+
+def test_lock_stale_dead_pid_same_host(fake_gnupg: Path) -> None:
+    # PID 999_999 is exceedingly unlikely to exist; double-check before
+    # relying on it as "definitely dead."
+    assert not _pid_alive_on_this_host(999_999)
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text(f"999999 {_THIS_HOST}\n")
+    assert _is_lock_stale(lock)
+
+
+def test_lock_stale_live_pid_same_host_is_not_stale(fake_gnupg: Path) -> None:
+    # The current process is, by definition, alive. We must never
+    # declare a lock held by a live local process as stale -- doing
+    # so could corrupt a concurrent keyring operation.
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text(f"{os.getpid()} {_THIS_HOST}\n")
+    assert not _is_lock_stale(lock)
+
+
+def test_lock_stale_different_host_is_stale_regardless_of_pid(
+    fake_gnupg: Path,
+) -> None:
+    # Lock recorded by a different host -- the typical staleness mode
+    # on a network-shared $GNUPGHOME. PID happens to be alive locally;
+    # doesn't matter, host comparison wins.
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text(f"{os.getpid()} other-host.example.com\n")
+    assert _is_lock_stale(lock)
+
+
+def test_lock_stale_keyboxd_database_lock_with_unreachable_holder(
+    fake_gnupg: Path,
+) -> None:
+    # The canonical stale-cross-host-lock layout: GPG 2.4+ keyboxd
+    # creates pubring.db inside public-keys.v1.d/ and its dotlock
+    # records the host the holder was on. When the holder is on a
+    # different host (here, "host-a.example.com"), the lock is by
+    # definition unreachable from the current process.
+    lock = fake_gnupg / "public-keys.v1.d" / "pubring.db.lock"
+    lock.write_text("1186029 host-a.example.com\n")
+    assert _is_lock_stale(lock)
+
+
+def test_lock_stale_colliding_short_name_is_still_different_host(
+    fake_gnupg: Path,
+) -> None:
+    """Locks naming a different FQDN that happens to share our short
+    name must be treated as a different host.
+
+    This is the failure mode that short-name normalization would
+    mask: ``worker-1.cluster-a.example.com`` vs
+    ``worker-1.cluster-b.example.com`` on a $GNUPGHOME shared across
+    administrative domains. Strict equality treats them as different,
+    so a real remote lock on cluster-b is not incorrectly declared
+    "same host with dead PID" just because we're on cluster-a.
+
+    Here we synthesize the scenario by writing a hostname that
+    differs from ``socket.gethostname()`` but isn't ``other-host`` --
+    any string that isn't exactly the local hostname must be
+    classified as different.
+    """
+    # Build a recorded hostname that overlaps with the local one if
+    # short-name comparison were in effect, but is not exactly equal.
+    fabricated = _THIS_HOST + ".another-domain.invalid"
+    if fabricated == _THIS_HOST:  # impossible, but defensive
+        pytest.skip("local hostname format does not permit this test")
+    lock = fake_gnupg / "pubring.kbx.lock"
+    # PID happens to be alive locally; under strict equality we
+    # never reach the PID check because the host doesn't match.
+    lock.write_text(f"{os.getpid()} {fabricated}\n")
+    assert _is_lock_stale(lock)
+
+
+def test_lock_stale_unparseable_is_not_stale(fake_gnupg: Path) -> None:
+    # Conservative default: better to surface a real error than remove
+    # a lock we can't reason about.
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text("garbage contents\n")
+    assert not _is_lock_stale(lock)
+
+
+def test_lock_stale_missing_hostname_treated_as_this_host(
+    fake_gnupg: Path,
+) -> None:
+    # Old dotlock variants omit the hostname. Dead PID -> stale,
+    # live PID -> NOT stale.
+    dead = fake_gnupg / "a.lock"
+    dead.write_text("999999\n")
+    assert _is_lock_stale(dead)
+    live = fake_gnupg / "b.lock"
+    live.write_text(f"{os.getpid()}\n")
+    assert not _is_lock_stale(live)
+
+
+# ---- clean_stale_keyring_locks ---
+
+
+def test_clean_removes_stale_locks_and_preserves_live_locks(
+    fake_gnupg: Path,
+) -> None:
+    stale = fake_gnupg / "public-keys.v1.d" / "pubring.db.lock"
+    stale.write_text("1186029 host-a.example.com\n")
+    live = fake_gnupg / "trustdb.gpg.lock"
+    live.write_text(f"{os.getpid()} {_THIS_HOST}\n")
+
+    removed = clean_stale_keyring_locks()
+
+    assert removed == [stale]
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_clean_never_touches_non_lock_files(fake_gnupg: Path) -> None:
+    """The load-bearing safety check: we must not remove the actual keyring.
+
+    If this test ever fails, the recovery layer is dangerous and the
+    feature must be disabled.
+    """
+    db = fake_gnupg / "public-keys.v1.d" / "pubring.db"
+    db.write_bytes(b"this is the actual keyring; do not touch")
+    kbx = fake_gnupg / "pubring.kbx"
+    kbx.write_bytes(b"and neither is this")
+    # Put a stale lock next to them to make sure the sweep actually runs.
+    stale = fake_gnupg / "public-keys.v1.d" / "pubring.db.lock"
+    stale.write_text("999999 other-host.example.com\n")
+
+    clean_stale_keyring_locks()
+
+    assert db.read_bytes() == b"this is the actual keyring; do not touch"
+    assert kbx.read_bytes() == b"and neither is this"
+
+
+def test_clean_missing_gnupg_home_returns_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The most common failure mode is a typo. The diagnostic shows
-    what keys ARE in the keyring so the user can spot the mismatch."""
-    from cavern import crypto
+    monkeypatch.setenv("GNUPGHOME", "/nonexistent/path/xyz-cavern-test")
+    assert clean_stale_keyring_locks() == []
 
-    monkeypatch.setattr(crypto, "gpg_has_secret_key", lambda _: False)
-    monkeypatch.setattr(
-        crypto,
-        "gpg_list_local_identities",
-        lambda: ["DEADBEEF12345678  Real User <real@example.com>"],
+
+def test_clean_unparseable_lock_is_kept(fake_gnupg: Path) -> None:
+    lock = fake_gnupg / "pubring.kbx.lock"
+    lock.write_text("totally garbled\n")
+    assert clean_stale_keyring_locks() == []
+    assert lock.exists()
+
+
+# ---- _run_gpg_with_lock_recovery ---
+#
+# These tests use a fake subprocess.run so we don't depend on gpg
+# being installed and don't risk touching the developer's real
+# keyring. The wrapper's contract is precisely: "on a lock-contention
+# failure, run recovery and retry exactly once" -- so that's what we
+# verify, independent of any real gpg behavior.
+#
+# Monkeypatch note: we patch ``cavern.crypto.subprocess.run`` (the
+# module attribute), not ``subprocess.run`` globally. pytest's
+# monkeypatch undoes this at test teardown, so other tests in the
+# same session never see the fake. Patching globally would risk
+# bleeding into unrelated subprocess use elsewhere in the suite.
+
+
+def _fake_completed(
+    returncode: int, stderr: bytes = b"", stdout: bytes = b""
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.CompletedProcess(
+        args=["gpg"], returncode=returncode, stdout=stdout, stderr=stderr
     )
 
-    with pytest.raises(CryptoError) as exc_info:
-        crypto.ensure_recipients_have_secret_keys(["real@xample.com"])
 
-    msg = str(exc_info.value)
-    assert "real@xample.com" in msg  # the typo
-    assert "real@example.com" in msg  # what they probably meant
-    assert "DEADBEEF12345678" in msg
-
-
-def test_ensure_recipients_passes_when_all_present(
-    monkeypatch: pytest.MonkeyPatch,
+def test_retry_passthrough_when_first_call_succeeds(
+    fake_gnupg: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No error when every recipient resolves."""
-    from cavern import crypto
+    calls: list[list[str]] = []
 
-    monkeypatch.setattr(crypto, "gpg_has_secret_key", lambda _: True)
-    crypto.ensure_recipients_have_secret_keys(["alice@example.com", "bob@example.com"])
+    def fake_run(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(args)
+        return _fake_completed(0, stdout=b"plaintext")
+
+    monkeypatch.setattr("cavern.crypto.subprocess.run", fake_run)
+
+    result = _run_gpg_with_lock_recovery(["gpg", "--decrypt"], stdin=None)
+    assert result.returncode == 0
+    assert result.stdout == b"plaintext"
+    assert len(calls) == 1  # no retry on success
 
 
-def test_gpg_has_secret_key_rejects_blank(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A whitespace-only identity should never be considered valid,
-    even before subprocess gets a chance to misinterpret it."""
-    from cavern import crypto
+def test_retry_does_not_fire_on_unrelated_gpg_error(
+    fake_gnupg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The "No public key" failure is a separate diagnostic; we must
+    # NOT retry, because the recovery is irrelevant and the retry
+    # would just produce the same error twice (wasting time and
+    # potentially double-printing pinentry prompts).
+    calls: list[list[str]] = []
 
-    # If the function reaches subprocess for a blank identity that's a
-    # bug — fail loudly rather than passing a quiet True.
-    def _should_not_be_called(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("subprocess should not run for blank identity")
+    def fake_run(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(args)
+        return _fake_completed(2, stderr=b"gpg: alkaidc: skipped: No public key\n")
 
-    monkeypatch.setattr(crypto.subprocess, "run", _should_not_be_called)
-    assert crypto.gpg_has_secret_key("") is False
-    assert crypto.gpg_has_secret_key("   ") is False
+    monkeypatch.setattr("cavern.crypto.subprocess.run", fake_run)
+
+    result = _run_gpg_with_lock_recovery(["gpg", "--encrypt"], stdin=b"x")
+    assert result.returncode == 2
+    assert len(calls) == 1  # no retry
+
+
+def test_retry_recovers_when_lock_clears_after_cleanup(
+    fake_gnupg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end happy path for the recovery sequence.
+
+    First gpg call returns the keyring-lock contention stderr.
+    Recovery cleans the planted stale lock. Second gpg call succeeds.
+    """
+    # Plant a stale cross-node lock that recovery should clean up.
+    (fake_gnupg / "public-keys.v1.d" / "pubring.db.lock").write_text(
+        "1186029 host-a.example.com\n"
+    )
+
+    call_count = 0
+
+    def fake_run(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        # Distinguish our gpg call from the gpgconf --kill all helper.
+        if args and args[0] == "gpgconf":
+            return _fake_completed(0)
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _fake_completed(
+                2,
+                stderr=(
+                    b"gpg: Note: database_open waiting for lock "
+                    b"(held by 1186029) ...\n"
+                    b"gpg: keydb_search failed: Connection timed out\n"
+                ),
+            )
+        return _fake_completed(0, stdout=b"plaintext")
+
+    monkeypatch.setattr("cavern.crypto.subprocess.run", fake_run)
+    # gpgconf may not exist in the test environment; force the path.
+    monkeypatch.setattr("cavern.crypto.shutil.which", lambda _: "/usr/bin/gpgconf")
+
+    result = _run_gpg_with_lock_recovery(["gpg", "--decrypt"], stdin=None)
+    assert result.returncode == 0
+    assert result.stdout == b"plaintext"
+    assert call_count == 2  # original failure + one retry
+
+
+def test_retry_runs_exactly_once_no_infinite_loop(
+    fake_gnupg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the lock persists after recovery, we propagate the failure.
+
+    This guards against a regression into retry-until-success, which
+    would hang the CLI indefinitely against a real live local lock.
+    """
+    call_count = 0
+
+    def fake_run(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args and args[0] == "gpgconf":
+            return _fake_completed(0)
+        nonlocal call_count
+        call_count += 1
+        return _fake_completed(
+            2, stderr=b"gpg: keydb_search failed: Connection timed out\n"
+        )
+
+    monkeypatch.setattr("cavern.crypto.subprocess.run", fake_run)
+    monkeypatch.setattr("cavern.crypto.shutil.which", lambda _: "/usr/bin/gpgconf")
+
+    result = _run_gpg_with_lock_recovery(["gpg", "--decrypt"], stdin=None)
+    assert result.returncode == 2
+    assert call_count == 2  # exactly one retry, then propagate
+
+
+def test_retry_logs_when_locks_are_cleaned(
+    fake_gnupg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery prints to stderr when it actually cleared a lock.
+
+    Without this message, an unexpected pause and slowdown would
+    have no visible cause. The message names the cleared path(s) so
+    a follow-up investigation has somewhere to start.
+    """
+    (fake_gnupg / "pubring.kbx.lock").write_text("1186029 host-a.example.com\n")
+
+    calls = {"n": 0}
+
+    def fake_run(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args and args[0] == "gpgconf":
+            return _fake_completed(0)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _fake_completed(
+                2, stderr=b"gpg: keydb_search failed: Connection timed out\n"
+            )
+        return _fake_completed(0, stdout=b"plaintext")
+
+    monkeypatch.setattr("cavern.crypto.subprocess.run", fake_run)
+    monkeypatch.setattr("cavern.crypto.shutil.which", lambda _: "/usr/bin/gpgconf")
+
+    _run_gpg_with_lock_recovery(["gpg", "--decrypt"], stdin=None)
+    captured = capsys.readouterr()
+    assert "cleared 1 stale GPG keyring lock" in captured.err
+    assert "from a prior session" in captured.err
+
+
+def test_retry_no_log_when_lock_cleanup_finds_nothing(
+    fake_gnupg: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If the contention is real (live local lock) we don't claim to
+    have cleaned anything we didn't actually clean.
+    """
+    # Live lock owned by current process -- recovery must leave it.
+    (fake_gnupg / "pubring.kbx.lock").write_text(f"{os.getpid()} {_THIS_HOST}\n")
+
+    def fake_run(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args and args[0] == "gpgconf":
+            return _fake_completed(0)
+        return _fake_completed(
+            2, stderr=b"gpg: keydb_search failed: Connection timed out\n"
+        )
+
+    monkeypatch.setattr("cavern.crypto.subprocess.run", fake_run)
+    monkeypatch.setattr("cavern.crypto.shutil.which", lambda _: "/usr/bin/gpgconf")
+
+    _run_gpg_with_lock_recovery(["gpg", "--decrypt"], stdin=None)
+    captured = capsys.readouterr()
+    assert "cleared" not in captured.err

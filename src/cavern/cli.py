@@ -37,7 +37,7 @@ from typing import BinaryIO
 from . import crypto, git, session
 from .audit import AuditLog
 from .clipboard import DEFAULT_CLEAR_AFTER, copy_with_autoclear
-from .exceptions import CavernError, GitError
+from .exceptions import CavernError, GitError, NotInitializedError
 from .generator import PasswordPolicy, generate_password
 from .totp import current_totp
 from .vault import UnlockedKeys, Vault
@@ -101,12 +101,57 @@ def _normalize_name(name: str) -> str:
 
 
 def cmd_init(args: argparse.Namespace, vault: Vault) -> int:
+    _ensure_recipients_or_offer_keygen(args.gpg_id)
     keys = vault.init(args.gpg_id)
     git.init(vault.root)
     _auto_commit(vault, f"Initialize vault with GPG id {' '.join(args.gpg_id)}")
     AuditLog(vault.root, keys.master_key).append("init", recipients=list(args.gpg_id))
     print(f"Initialized empty cavern vault at {vault.root}")
     return 0
+
+
+def _ensure_recipients_or_offer_keygen(recipients: list[str]) -> None:
+    """Pre-flight check that every recipient has a usable GPG secret key.
+
+    When run on a TTY and a key is missing, offer to launch
+    ``gpg --full-generate-key`` interactively. Off a TTY (CI, scripts,
+    tests), skip the prompt and just raise — silent prompting in
+    automated contexts is worse than failing fast.
+
+    Re-checks after a wizard run because the user may have generated
+    a key under a different identity than the one passed to
+    ``cavern init``.
+    """
+    try:
+        crypto.ensure_recipients_have_secret_keys(recipients)
+        return
+    except CavernError as exc:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise
+        # Print the diagnostic before the prompt so the user sees what
+        # went wrong before deciding.
+        print(f"cavern: {exc}", file=sys.stderr)
+        print(file=sys.stderr)
+
+    answer = (
+        input("Run `gpg --full-generate-key` to create a new key now? [y/N] ")
+        .strip()
+        .lower()
+    )
+    if answer not in {"y", "yes"}:
+        raise CavernError("Vault initialization aborted; no GPG key available.")
+
+    rc = crypto.gpg_run_keygen_wizard()
+    if rc != 0:
+        raise CavernError(
+            f"gpg key generation exited with status {rc}; "
+            f"vault initialization aborted."
+        )
+
+    # The user may have generated a key with a uid that doesn't match
+    # the identifier they passed to `cavern init`. Re-check so we
+    # surface the mismatch immediately rather than at encryption time.
+    crypto.ensure_recipients_have_secret_keys(recipients)
 
 
 def cmd_unlock(args: argparse.Namespace, vault: Vault) -> int:
@@ -795,6 +840,13 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+# Commands that may run on a directory that isn't yet a cavern vault.
+# Everything else is rejected up front with a clear hint, before the
+# command handler runs, so that handlers and their downstream calls
+# (subprocess invocations of git, etc.) can assume the vault exists.
+_COMMANDS_WITHOUT_INIT: frozenset[str] = frozenset({"init"})
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -803,6 +855,13 @@ def main(argv: list[str] | None = None) -> int:
     vault = Vault(root=args.vault)
 
     try:
+        if args.command not in _COMMANDS_WITHOUT_INIT and not vault.is_initialized():
+            raise NotInitializedError(
+                f"No vault at {vault.root}.\n"
+                f"  Run `cavern init <gpg-id>` to create one, or set "
+                f"$CAVERN_VAULT_DIR / pass --vault to point at an "
+                f"existing vault."
+            )
         return int(args.func(args, vault))
     except CavernError as exc:
         print(f"cavern: {exc}", file=sys.stderr)

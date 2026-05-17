@@ -186,6 +186,118 @@ def gpg_reload_agent() -> None:
     )
 
 
+def gpg_has_secret_key(identity: str) -> bool:
+    """Return True iff ``identity`` resolves to a usable secret key.
+
+    Cavern's flow encrypts the master key *to* a recipient at init
+    time and then decrypts it on every unlock, so the user needs both
+    the public and private halves of the key. Checking for the secret
+    key is sufficient: ``gpg`` cannot produce a secret-key listing
+    without the matching public key, so a successful match here means
+    encryption AND decryption will both work later.
+
+    The check uses ``--list-secret-keys --with-colons``; exit code 0
+    means at least one matching key was found. We swallow stderr to
+    keep the error path silent — the caller decides what diagnostic
+    to surface.
+    """
+    if not identity.strip():
+        return False
+    result = subprocess.run(
+        [GPG_BINARY, "--list-secret-keys", "--with-colons", identity],
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def gpg_list_local_identities() -> list[str]:
+    """Return a short summary of every secret key in the local keyring.
+
+    Used purely for diagnostic output when a recipient lookup fails —
+    the user often just typed a name slightly wrong, and showing the
+    keys they DO have makes the fix obvious. Best-effort: returns
+    an empty list on any parsing trouble rather than raising.
+
+    Output format per entry: ``"<long-keyid>  <primary-uid>"``.
+    """
+    result = subprocess.run(
+        [GPG_BINARY, "--list-secret-keys", "--with-colons"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    identities: list[str] = []
+    current_keyid: str | None = None
+    for line in result.stdout.decode(errors="replace").splitlines():
+        # gpg's colon-delimited format: field 1 is the record type.
+        # `sec` introduces a secret key (field 5 = long key ID).
+        # `uid` is a user ID associated with the most recent key
+        # (field 10 = user ID string).
+        fields = line.split(":")
+        if not fields:
+            continue
+        if fields[0] == "sec" and len(fields) > 4:
+            current_keyid = fields[4]
+        elif fields[0] == "uid" and current_keyid and len(fields) > 9:
+            identities.append(f"{current_keyid}  {fields[9]}")
+            current_keyid = None  # only take the primary uid
+    return identities
+
+
+def ensure_recipients_have_secret_keys(recipients: list[str]) -> None:
+    """Verify every recipient resolves to a usable secret key.
+
+    Raises :class:`CryptoError` if any are missing. The error message
+    is formatted for direct display to the user: it lists the missing
+    identities, shows what keys ARE in the keyring (so a typo is
+    obvious), and points at concrete next steps.
+
+    Call this BEFORE :func:`gpg_encrypt_to_recipients` to convert
+    cryptic errors like ``gpg: alice: skipped: No public key`` into
+    actionable diagnostics.
+    """
+    missing = [r for r in recipients if not gpg_has_secret_key(r)]
+    if not missing:
+        return
+
+    available = gpg_list_local_identities()
+
+    lines = [f"No GPG secret key found for: {', '.join(missing)}", ""]
+    if available:
+        lines.append("Keys available in your keyring:")
+        for entry in available:
+            lines.append(f"  - {entry}")
+        lines.append("")
+        lines.append(
+            "If one of these is yours, re-run with that key ID or " "associated email."
+        )
+    else:
+        lines.append("Your GPG keyring has no secret keys.")
+    lines.extend(
+        [
+            "",
+            "To fix this you can:",
+            "  - Generate a new key:    gpg --full-generate-key",
+            "  - Import an existing key: gpg --import <key.asc>",
+        ]
+    )
+    raise CryptoError("\n".join(lines))
+
+
+def gpg_run_keygen_wizard() -> int:
+    """Spawn ``gpg --full-generate-key`` interactively and return its exit code.
+
+    Inherits stdin/stdout/stderr from the current process so gpg can
+    drive its own wizard (which uses curses/pinentry depending on
+    setup). We do not touch the user's keyring directly — gpg owns
+    that completely; we just provide a convenient on-ramp.
+    """
+    return subprocess.run([GPG_BINARY, "--full-generate-key"], check=False).returncode
+
+
 # ---- Key hierarchy ----------------------------------------------------------
 
 

@@ -69,10 +69,10 @@ def test_bucket_selection(plaintext_len: int, expected_bucket: int) -> None:
         b"a" * 1024,
         b"a" * 5000,
         b"a" * 16384,
-        os.urandom(20_480),
+        os.urandom(20_000),
     ],
     # Without explicit ids, pytest renders each `bytes` parameter as
-    # its repr — so a 20 480-byte random value produces a 100 KB test
+    # its repr — so a 20 000-byte random value produces a 100 KB test
     # name. Naming each case keeps `pytest -v` output compact and
     # actually informative.
     ids=[
@@ -429,3 +429,71 @@ def test_rewrap_rejects_unknown_version() -> None:
         rewrap_master_key_in_blob(
             bytes(blob), os.urandom(MASTER_KEY_LENGTH), os.urandom(MASTER_KEY_LENGTH)
         )
+
+
+# ---- GPG recipient checks --------------------------------------------------
+
+
+def test_ensure_recipients_lists_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a recipient has no secret key, the error message lists the
+    missing identity and points at concrete remediation steps."""
+    from cavern import crypto
+
+    monkeypatch.setattr(crypto, "gpg_has_secret_key", lambda _: False)
+    monkeypatch.setattr(crypto, "gpg_list_local_identities", lambda: [])
+
+    with pytest.raises(CryptoError) as exc_info:
+        crypto.ensure_recipients_have_secret_keys(["alice@example.com"])
+
+    msg = str(exc_info.value)
+    assert "alice@example.com" in msg
+    assert "no secret keys" in msg.lower()
+    assert "gpg --full-generate-key" in msg
+
+
+def test_ensure_recipients_shows_available_keys_on_typo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The most common failure mode is a typo. The diagnostic shows
+    what keys ARE in the keyring so the user can spot the mismatch."""
+    from cavern import crypto
+
+    monkeypatch.setattr(crypto, "gpg_has_secret_key", lambda _: False)
+    monkeypatch.setattr(
+        crypto,
+        "gpg_list_local_identities",
+        lambda: ["DEADBEEF12345678  Real User <real@example.com>"],
+    )
+
+    with pytest.raises(CryptoError) as exc_info:
+        crypto.ensure_recipients_have_secret_keys(["real@xample.com"])
+
+    msg = str(exc_info.value)
+    assert "real@xample.com" in msg  # the typo
+    assert "real@example.com" in msg  # what they probably meant
+    assert "DEADBEEF12345678" in msg
+
+
+def test_ensure_recipients_passes_when_all_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No error when every recipient resolves."""
+    from cavern import crypto
+
+    monkeypatch.setattr(crypto, "gpg_has_secret_key", lambda _: True)
+    crypto.ensure_recipients_have_secret_keys(["alice@example.com", "bob@example.com"])
+
+
+def test_gpg_has_secret_key_rejects_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A whitespace-only identity should never be considered valid,
+    even before subprocess gets a chance to misinterpret it."""
+    from cavern import crypto
+
+    # If the function reaches subprocess for a blank identity that's a
+    # bug — fail loudly rather than passing a quiet True.
+    def _should_not_be_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("subprocess should not run for blank identity")
+
+    monkeypatch.setattr(crypto.subprocess, "run", _should_not_be_called)
+    assert crypto.gpg_has_secret_key("") is False
+    assert crypto.gpg_has_secret_key("   ") is False

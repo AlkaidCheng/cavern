@@ -809,6 +809,48 @@ def test_retry_runs_exactly_once_no_infinite_loop(
     assert call_count == 2  # exactly one retry, then propagate
 
 
+def test_retry_preserves_first_failure_when_retry_fails_differently(
+    fake_gnupg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the retry fails with a different error, the original
+    first-attempt result is returned.
+
+    Recovery can perturb local state (terminating the agent, removing
+    lockfiles) so the retry's stderr may reflect a downstream side
+    effect rather than the failure the caller was trying to act on.
+    Surfacing the *first* result keeps the diagnostic faithful to
+    what the gpg invocation actually failed on; the user can re-run
+    cavern to see any new error that has emerged in its own right.
+    """
+    distinctive_first = (
+        b"gpg: Note: database_open waiting for lock (held by 1186029) ...\n"
+        b"gpg: keydb_search failed: Connection timed out\n"
+    )
+    distinctive_second = b"gpg: agent_genkey failed: No pinentry\n"
+
+    calls = {"n": 0}
+
+    def fake_run(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if args and args[0] == "gpgconf":
+            return _fake_completed(0)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _fake_completed(2, stderr=distinctive_first)
+        return _fake_completed(2, stderr=distinctive_second)
+
+    monkeypatch.setattr("cavern.crypto.subprocess.run", fake_run)
+    monkeypatch.setattr("cavern.crypto.shutil.which", lambda _: "/usr/bin/gpgconf")
+
+    result = _run_gpg_with_lock_recovery(["gpg", "--decrypt"], stdin=None)
+    assert calls["n"] == 2  # exactly one retry happened
+    assert result.returncode == 2
+    assert result.stderr == distinctive_first, (
+        "expected the original first-attempt stderr; recovery side "
+        "effects must not overwrite the diagnostic the caller raises"
+    )
+
 def test_retry_logs_when_locks_are_cleaned(
     fake_gnupg: Path,
     monkeypatch: pytest.MonkeyPatch,

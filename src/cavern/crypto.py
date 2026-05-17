@@ -500,18 +500,33 @@ def _run_gpg_with_lock_recovery(
        ``$GNUPGHOME``).
     3. The gpg call is retried exactly once.
 
-    If the second attempt still fails, the result is returned as-is
-    so the caller raises its normal :class:`CryptoError` with the
-    original gpg stderr. The retry is bounded to one attempt: a
-    persistent live lock cannot induce an unbounded loop, and real
-    failures are not masked by repeated retries.
+    Returned result:
+
+    * If the first call succeeds, its :class:`CompletedProcess` is
+      returned (no recovery happens).
+    * If the first call fails with a non-lock-contention error, its
+      :class:`CompletedProcess` is returned unchanged (no recovery).
+    * If the first call fails with lock contention and the retry
+      succeeds, the retry's :class:`CompletedProcess` is returned.
+    * If the first call fails with lock contention and the retry
+      also fails, the *first* :class:`CompletedProcess` is returned
+      so the caller surfaces the original diagnostic. Recovery
+      perturbs local state (terminated daemons, removed lockfiles)
+      and the retry's stderr may reflect a downstream side effect
+      rather than the failure the caller was trying to act on; if
+      the original lock contention is still the relevant problem,
+      reporting it directly is more useful than a derivative error.
+
+    The retry is bounded to one attempt: a persistent live lock
+    cannot induce an unbounded loop, and real failures are not
+    masked by repeated retries.
     """
-    result = subprocess.run(args, input=stdin, capture_output=True, check=False)
-    if result.returncode == 0:
-        return result
-    stderr_text = result.stderr.decode(errors="replace")
+    first_result = subprocess.run(args, input=stdin, capture_output=True, check=False)
+    if first_result.returncode == 0:
+        return first_result
+    stderr_text = first_result.stderr.decode(errors="replace")
     if not _is_lock_contention(stderr_text):
-        return result
+        return first_result
     _gpg_kill_local_daemons()
     removed = clean_stale_keyring_locks()
     if removed:
@@ -523,7 +538,14 @@ def _run_gpg_with_lock_recovery(
             f"lock(s) from a prior session: {paths_str}",
             file=sys.stderr,
         )
-    return subprocess.run(args, input=stdin, capture_output=True, check=False)
+    retry_result = subprocess.run(args, input=stdin, capture_output=True, check=False)
+    if retry_result.returncode == 0:
+        return retry_result
+    # Recovery did not resolve the failure. Preserve the original
+    # diagnostic so the caller's :class:`CryptoError` reflects what
+    # the gpg invocation actually failed on, not a side effect of
+    # recovery (terminated agent, etc.).
+    return first_result
 
 
 # ---- Key hierarchy ----------------------------------------------------------

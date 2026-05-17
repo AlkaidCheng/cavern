@@ -73,8 +73,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import struct
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,6 +91,19 @@ from .exceptions import CryptoError
 
 GPG_BINARY = "gpg"
 GPG_AGENT_BINARY = "gpg-connect-agent"
+GPGCONF_BINARY = "gpgconf"
+
+# Substrings in ``gpg`` stderr that indicate a keyring-lock contention.
+# Any one of these triggers the stale-lock recovery sequence in
+# :func:`_run_gpg_with_lock_recovery`. The three appear together when
+# the lockfile holder is unreachable (typically a daemon stranded on
+# another host with a shared ``$GNUPGHOME``), but matching any one is
+# sufficient for recovery to engage.
+_LOCK_CONTENTION_INDICATORS = (
+    "waiting for lock",
+    "keydb_search failed",
+    "Connection timed out",
+)
 
 KEK_LENGTH = 32  # bytes; AES-256
 MASTER_KEY_LENGTH = 32
@@ -150,7 +165,7 @@ def gpg_encrypt_to_recipients(plaintext: bytes, recipients: list[str]) -> bytes:
     args = [GPG_BINARY, "--quiet", "--batch", "--yes", "--encrypt"]
     for recipient in recipients:
         args.extend(["--recipient", recipient])
-    result = subprocess.run(args, input=plaintext, capture_output=True, check=False)
+    result = _run_gpg_with_lock_recovery(args, stdin=plaintext)
     if result.returncode != 0:
         raise CryptoError(
             f"gpg encrypt failed: {result.stderr.decode(errors='replace').strip()}"
@@ -167,7 +182,7 @@ def gpg_decrypt(ciphertext_path: Path) -> bytes:
     if not ciphertext_path.is_file():
         raise CryptoError(f"GPG-encrypted file not found: {ciphertext_path}")
     args = [GPG_BINARY, "--quiet", "--decrypt", str(ciphertext_path)]
-    result = subprocess.run(args, capture_output=True, check=False)
+    result = _run_gpg_with_lock_recovery(args, stdin=None)
     if result.returncode != 0:
         raise CryptoError(
             f"gpg decrypt failed: {result.stderr.decode(errors='replace').strip()}"
@@ -296,6 +311,219 @@ def gpg_run_keygen_wizard() -> int:
     that completely; we just provide a convenient on-ramp.
     """
     return subprocess.run([GPG_BINARY, "--full-generate-key"], check=False).returncode
+
+
+# ---- GPG keyring-lock recovery ---------------------------------------------
+#
+# When ``~/.gnupg`` lives on a network filesystem (NFS, SMB, or any
+# distributed filesystem shared across multiple machines), a session
+# that ends ungracefully can leave a ``gpg-agent`` or ``keyboxd``
+# daemon stranded on the prior machine still holding the keyring
+# lock. The next gpg invocation from another machine waits for the
+# unreachable holder and eventually fails with ``keydb_search
+# failed: Connection timed out``. Without recovery, every fresh
+# session fails until the stale lockfile is manually deleted.
+#
+# Recovery is deliberately conservative: only ``*.lock`` files are
+# ever considered for removal (keyring databases such as
+# ``pubring.kbx`` and ``pubring.db`` are never touched), and a lock
+# held by a live process on the current host is left alone. The
+# retry is bounded to one attempt so a persistent live lock cannot
+# induce an unbounded loop.
+
+
+def _is_lock_contention(stderr: str) -> bool:
+    """Return True if ``stderr`` matches a GPG keyring-lock contention pattern."""
+    return any(s in stderr for s in _LOCK_CONTENTION_INDICATORS)
+
+
+def _pid_alive_on_this_host(pid: int) -> bool:
+    """Return True if ``pid`` is a running process on the current host.
+
+    Uses ``os.kill(pid, 0)`` as the canonical liveness probe. The
+    answer is only meaningful for processes on the same host; a PID
+    coincidence with a process on a different host would be
+    misleading, so :func:`_is_lock_stale` gates this on hostname.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user — still alive.
+        return True
+    return True
+
+
+def _parse_dotlock(path: Path) -> tuple[int, str] | None:
+    """Parse a GnuPG dotlock file. Return ``(pid, hostname)`` or ``None``.
+
+    GnuPG's dotlock format is a single line ``<pid> <hostname>\\n``.
+    Older variants omit the hostname. Anything that cannot be parsed
+    returns ``None``, which callers conservatively treat as not
+    stale.
+    """
+    try:
+        content = path.read_text(errors="replace")
+    except OSError:
+        return None
+    lines = content.strip().splitlines()
+    if not lines:
+        return None
+    parts = lines[0].split()
+    if not parts:
+        return None
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        return None
+    hostname = parts[1] if len(parts) > 1 else ""
+    return pid, hostname
+
+
+def _same_host(recorded: str) -> bool:
+    """Return True if ``recorded`` names the current host.
+
+    Comparison is by exact string equality against
+    ``socket.gethostname()``. GPG's dotlock implementation populates
+    the hostname field by calling ``gethostname(2)``, the same
+    syscall ``socket.gethostname()`` invokes; on the same host
+    across runs the two values are bit-identical, so strict equality
+    is the right primitive.
+
+    Fuzzy matching (such as short-name normalization) would collide
+    two different hosts that happen to share a short name. Strict
+    equality keeps the contract simple: if the recorded value does
+    not exactly match this host's hostname, the lock is treated as
+    coming from a different host.
+
+    An empty string is treated as the same host: older dotlock
+    variants omit the hostname, and in that mode the PID-liveness
+    check is the only signal available.
+    """
+    if not recorded:
+        return True
+    return recorded == socket.gethostname()
+
+
+def _is_lock_stale(path: Path) -> bool:
+    """Return True if a GPG dotlock is provably stale and safe to remove.
+
+    A lock is *provably stale* when one of the following holds:
+
+    1. The lockfile records the current host (or omits the
+       hostname) and the recorded PID is not running on this host.
+    2. The lockfile records a different host. The holder is
+       unreachable from here, so waiting on it cannot make progress.
+
+    Returns ``False`` conservatively when the lockfile cannot be
+    parsed, or when the holder is alive on this host.
+    """
+    parsed = _parse_dotlock(path)
+    if parsed is None:
+        return False
+    pid, hostname = parsed
+    if _same_host(hostname):
+        return not _pid_alive_on_this_host(pid)
+    return True
+
+
+def clean_stale_keyring_locks() -> list[Path]:
+    """Remove provably-stale GPG dotlock files under ``$GNUPGHOME``.
+
+    Returns
+    -------
+    list[Path]
+        The paths actually removed. Empty if ``$GNUPGHOME`` is
+        missing, no lockfiles are present, or none are provably
+        stale.
+
+    Notes
+    -----
+    Only files matching ``*.lock`` are ever considered. The keyring
+    database files (``pubring.kbx``, ``pubring.db``, ``trustdb.gpg``,
+    and so on) are never touched. Used as a recovery step by
+    :func:`_run_gpg_with_lock_recovery`. Exposed as a module-level
+    function so it remains independently testable.
+    """
+    home = Path(os.environ.get("GNUPGHOME") or (Path.home() / ".gnupg"))
+    if not home.is_dir():
+        return []
+    removed: list[Path] = []
+    for lock in home.rglob("*.lock"):
+        if not _is_lock_stale(lock):
+            continue
+        try:
+            lock.unlink()
+        except FileNotFoundError:
+            # Another process cleaned the same lock; benign race.
+            pass  # noqa: S110 -- intentional: race is benign
+        except OSError:
+            # Permission, EBUSY, etc. — leave it and let the original
+            # gpg error surface if the lock remains relevant.
+            continue
+        else:
+            removed.append(lock)
+    return removed
+
+
+def _gpg_kill_local_daemons() -> None:
+    """Ask ``gpgconf`` to terminate the calling user's GPG daemons.
+
+    Handles the same-host stale-daemon case where ``gpg-agent`` or
+    ``keyboxd`` is still running locally and just needs to release
+    its handle on the keyring database. Silent no-op when
+    ``gpgconf`` is unavailable.
+    """
+    if shutil.which(GPGCONF_BINARY) is None:
+        return
+    subprocess.run(
+        [GPGCONF_BINARY, "--kill", "all"],
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_gpg_with_lock_recovery(
+    args: list[str], *, stdin: bytes | None
+) -> subprocess.CompletedProcess[bytes]:
+    """Run a gpg subprocess; recover and retry once on a lock-contention failure.
+
+    Recovery sequence on lock-contention stderr:
+
+    1. ``gpgconf --kill all`` terminates the calling user's local
+       GPG daemons (handles the same-host stale-daemon case).
+    2. ``$GNUPGHOME/**/*.lock`` is swept and provably-stale entries
+       are removed (handles cross-host staleness on shared
+       ``$GNUPGHOME``).
+    3. The gpg call is retried exactly once.
+
+    If the second attempt still fails, the result is returned as-is
+    so the caller raises its normal :class:`CryptoError` with the
+    original gpg stderr. The retry is bounded to one attempt: a
+    persistent live lock cannot induce an unbounded loop, and real
+    failures are not masked by repeated retries.
+    """
+    result = subprocess.run(args, input=stdin, capture_output=True, check=False)
+    if result.returncode == 0:
+        return result
+    stderr_text = result.stderr.decode(errors="replace")
+    if not _is_lock_contention(stderr_text):
+        return result
+    _gpg_kill_local_daemons()
+    removed = clean_stale_keyring_locks()
+    if removed:
+        # Use stderr so the message does not pollute stdout, which
+        # carries the decrypted plaintext for :func:`gpg_decrypt`.
+        paths_str = ", ".join(str(p) for p in removed)
+        print(
+            f"cavern: cleared {len(removed)} stale GPG keyring "
+            f"lock(s) from a prior session: {paths_str}",
+            file=sys.stderr,
+        )
+    return subprocess.run(args, input=stdin, capture_output=True, check=False)
 
 
 # ---- Key hierarchy ----------------------------------------------------------

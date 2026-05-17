@@ -149,6 +149,79 @@ def test_main_renders_cavern_error_cleanly(
     assert "Traceback" not in err
 
 
+def test_main_refuses_uninitialized_vault_with_hint(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Regression test for the `cavern git remote add ...` traceback bug.
+
+    Originally, running any command other than `init` against an
+    uninitialized vault dispatched straight to the handler. For
+    `cmd_git` that meant subprocess tried to ``cd`` into a missing
+    directory and surfaced a raw ``FileNotFoundError`` traceback to
+    the user, exposing internal paths and Python frames.
+
+    The fix centralized a guard in ``main()`` that rejects all
+    commands except ``init`` if the vault isn't initialized, with a
+    hint pointing the user at ``cavern init``.
+    """
+    from cavern import cli
+
+    monkeypatch.setattr(cli.crypto, "ensure_gpg_available", lambda: None)
+
+    missing_vault = tmp_path / "definitely-does-not-exist"
+    rc = cli.main(
+        [
+            "--vault",
+            str(missing_vault),
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@example.com:user/secrets.git",
+        ]
+    )
+    out, err = capsys.readouterr()
+
+    assert rc == 1
+    assert "Traceback" not in err
+    assert "FileNotFoundError" not in err
+    assert "cavern init" in err
+    # The bare path of the would-be vault should appear in the hint
+    # so the user can confirm cavern is looking where they expect.
+    assert str(missing_vault) in err
+
+
+def test_main_allows_init_on_uninitialized_vault(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`cavern init` is the one command that must run without a
+    pre-existing vault. The guard in main() should let it through.
+
+    We stub the entire init handler to a sentinel return so this test
+    is about the guard, not about init's downstream behavior (which
+    has its own tests in test_vault.py)."""
+    from cavern import cli
+
+    monkeypatch.setattr(cli.crypto, "ensure_gpg_available", lambda: None)
+
+    handler_called = False
+
+    def fake_init_handler(_args: object, _vault: object) -> int:
+        nonlocal handler_called
+        handler_called = True
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_init", fake_init_handler)
+
+    rc = cli.main(["--vault", str(tmp_path / "fresh"), "init", "user@test"])
+    assert rc == 0
+    assert (
+        handler_called
+    ), "init handler was not reached — the guard incorrectly blocked it"
+
+
 def test_main_handles_broken_pipe(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,

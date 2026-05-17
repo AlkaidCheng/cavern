@@ -82,6 +82,39 @@ processes honor it. A non-cavern process editing the directory does
 not, but that's already in the unsupported zone of the threat model
 ("attacker with write access to `~/.cavern/`").
 
+### Cavern auto-recovers from stale GPG keyring locks
+
+When `~/.gnupg` lives on a network filesystem (NFS, SMB, or any
+distributed filesystem shared across multiple machines), a session
+that ends ungracefully can leave a `gpg-agent` or `keyboxd` daemon
+stranded on the prior machine holding the keyring lock. The next
+session — typically on a different machine — then fails with `gpg:
+keydb_search failed: Connection timed out` and `public key
+decryption failed: No secret key`.
+
+This is not specific to any deployment; it happens anywhere a
+machine reboots while `gpg` was running, or where `$GNUPGHOME` is
+mounted across hosts that don't share a single agent.
+
+Cavern detects this failure mode (specific gpg stderr patterns) and
+runs a one-shot recovery before giving up: `gpgconf --kill all` to
+release any same-host stale daemons, then a sweep of
+`$GNUPGHOME/**/*.lock` removing any lockfile whose recorded holder is
+provably gone (PID dead on this host, or hostname differs from this
+host's `gethostname()`). The gpg call is then retried exactly once.
+
+The recovery is conservative: only `*.lock` files are ever considered
+(keyring databases like `pubring.kbx` and `pubring.db` are never
+touched), and a lock held by a live local process is left alone. If
+recovery clears a file, cavern prints one line on stderr naming the
+path(s) so you know what happened.
+
+**Side effect on the trust boundary:** cavern can `unlink()` files
+matching `*.lock` under `$GNUPGHOME`. This is the only way cavern
+modifies your GPG home. If you would rather diagnose lock failures
+manually, the recovery is bounded to the cases above and a non-stale
+lock will be left in place, surfacing the original error.
+
 ### "Soft delete" is not implemented
 
 `cavern rm` unlinks the file. There's no trash, no undo, no
@@ -237,3 +270,4 @@ Each is **not** a security regression — they're enhancements.
 If you find a security issue not covered above, please report it
 privately rather than opening a public issue. See [`SECURITY.md`](./SECURITY.md)
 for what's in and out of scope.
+

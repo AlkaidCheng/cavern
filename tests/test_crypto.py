@@ -851,6 +851,7 @@ def test_retry_preserves_first_failure_when_retry_fails_differently(
         "effects must not overwrite the diagnostic the caller raises"
     )
 
+
 def test_retry_logs_when_locks_are_cleaned(
     fake_gnupg: Path,
     monkeypatch: pytest.MonkeyPatch,
